@@ -1,4 +1,4 @@
-# push
+# push notifications playground (VAPID)
 
 To install dependencies:
 
