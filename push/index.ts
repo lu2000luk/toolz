@@ -1,25 +1,11 @@
 //@ts-nocheck
+// Dependencies
 // NPM: web-push
 // NPM: enquirer
 // NPM: fs-extra
 // NPM: mime-types
 // NPM: picocolors
 // NPM: figlet
-
-/*
-  Push Notification CLI (TUI)
-  Usage: ts-node push.ts <endpoint> <auth> <p256dh>
-
-  Features:
-  - TUI to build notification: title, body, icon, image, badge, vibrate, actions, data, etc.
-  - Pick an image using a native Windows Explorer dialog (OpenFileDialog)
-  - Simple progress indicator while sending
-  - Supports VAPID (recommended) or FCM Legacy Server Key
-
-  Notes:
-  - For web push to work, VAPID publicKey MUST match the one used when the client subscribed.
-  - FCM Legacy may be deprecated depending on your setup.
-*/
 
 import fs from 'fs-extra';
 import { spawn } from 'child_process';
