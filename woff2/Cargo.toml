@@ -1,0 +1,9 @@
+[package]
+name = "woff2decomp"
+version = "0.1.0"
+edition = "2021"
+
+
+[dependencies]
+woff2-patched = "0.4.0"
+windows = { version = "0.58.0", features = ["Win32_Foundation","Win32_UI_WindowsAndMessaging"] }
