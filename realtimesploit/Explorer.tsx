@@ -3,50 +3,74 @@ import { Box, Text, useInput } from "ink";
 import SelectInput from "ink-select-input";
 import Spinner from "ink-spinner";
 import TextInput from "ink-text-input";
-import { Database, ref, get, set } from "firebase/database";
-import { writeFile } from "fs/promises";
+import { Database, ref, get, set, update } from "firebase/database";
+import { writeFile, readFile, unlink } from "fs/promises";
+import { exec } from "child_process";
+import { resolve } from "path";
 import { inferNextId, inferSchema } from "./schemaUtils.ts";
+import { calculateDiff, type DiffChange } from "./diffUtils.ts";
 
 interface ExplorerProps {
 	db: Database;
 }
 
+type ExplorerMode =
+	| "BROWSE"
+	| "ADD_ID"
+	| "ADD_VALUE"
+	| "EDIT_PRIMITIVE"
+	| "DELETE_CONFIRM"
+	| "DUMPING"
+	| "EXTERNAL_EDIT_WAIT"
+	| "DIFF_REVIEW"
+	| "DIFF_APPLY_CONFIRM"
+	| "LOADING";
+
 export default function Explorer({ db }: ExplorerProps) {
+	// Navigation & Data
 	const [path, setPath] = useState<string>("/");
 	const [data, setData] = useState<any>(undefined);
-	const [loading, setLoading] = useState(false);
 	const [error, setError] = useState<string | null>(null);
-	const [dumping, setDumping] = useState(false);
-	const [dumpStatus, setDumpStatus] = useState<string | null>(null);
-	const [isEditing, setIsEditing] = useState(false);
-	const [editValue, setEditValue] = useState("");
-	const [writeStatus, setWriteStatus] = useState<string | null>(null);
 
-	// Add Mode State
-	const [isAdding, setIsAdding] = useState(false);
-	const [addStep, setAddStep] = useState<"id" | "value">("id");
+	// Mode Management
+	const [mode, setMode] = useState<ExplorerMode>("LOADING");
+	const [statusMessage, setStatusMessage] = useState<string | null>(null);
+
+	// Operation Specific State
+	// Adding
 	const [addId, setAddId] = useState("");
 	const [addValue, setAddValue] = useState("");
-	const [addStatus, setAddStatus] = useState<string | null>(null);
-	const [refreshTrigger, setRefreshTrigger] = useState(0);
-
-	// Schema options
 	const [availableSchemas, setAvailableSchemas] = useState<any[]>([]);
 	const [currentSchemaIndex, setCurrentSchemaIndex] = useState(0);
 
-	// Highlight tracking
-	const [highlightedItem, setHighlightedItem] = useState<string | null>(null);
-	const [deleteStatus, setDeleteStatus] = useState<string | null>(null);
+	// Editing Primitive
+	const [editValue, setEditValue] = useState("");
 
-	// Fetch data when path changes
+	// Deleting
+	const [itemToDelete, setItemToDelete] = useState<string | null>(null);
+
+	// External Edit
+	const [tempFilePath, setTempFilePath] = useState<string | null>(null);
+	const [diffs, setDiffs] = useState<DiffChange[]>([]);
+	const [diffCursor, setDiffCursor] = useState(0);
+
+	// Selection
+	const [highlightedItem, setHighlightedItem] = useState<string | null>(null);
+	const [refreshTrigger, setRefreshTrigger] = useState(0);
+
+	// Preferred preview field per parent path (e.g., "/users" -> "name")
+	const [preferredPreviewFields, setPreferredPreviewFields] = useState<
+		Record<string, string>
+	>({});
+
+	// --- IDLE/LOADING LOGIC ---
+
 	useEffect(() => {
 		let active = true;
-		setLoading(true);
+		setMode("LOADING");
 		setError(null);
-		setDumpStatus(null);
 		setHighlightedItem(null);
 
-		// Normalize path
 		const dbPath = path === "/" ? "/" : path;
 		const dbRef = ref(db, dbPath);
 
@@ -54,21 +78,25 @@ export default function Explorer({ db }: ExplorerProps) {
 			.then((snapshot) => {
 				if (active) {
 					if (snapshot.exists()) {
-						setData(snapshot.val());
+						const val = snapshot.val();
+						setData(val);
+						// Initialize highlightedItem to first key if data is an object
+						if (val && typeof val === "object" && !Array.isArray(val)) {
+							const keys = Object.keys(val);
+							if (keys.length > 0) {
+								setHighlightedItem(keys[0]!);
+							}
+						}
 					} else {
-						setData(null); // Explicit null for no data/null
+						setData(null);
 					}
+					setMode("BROWSE");
 				}
 			})
 			.catch((err) => {
 				if (active) {
 					setError(err.message);
-					setData(undefined);
-				}
-			})
-			.finally(() => {
-				if (active) {
-					setLoading(false);
+					setMode("BROWSE"); // Go back to browse even on error to allow nav
 				}
 			});
 
@@ -77,397 +105,751 @@ export default function Explorer({ db }: ExplorerProps) {
 		};
 	}, [db, path, refreshTrigger]);
 
-	const handleAddSubmit = useCallback(() => {
-		setLoading(true);
-		let finalVal: any = addValue;
-		try {
-			finalVal = JSON.parse(addValue);
-		} catch {
-			// Fallback to string if not valid JSON, but for objects we prefer JSON
-			// If the user wants a string, they should quote it in JSON
-			setAddStatus("Invalid JSON. Please provide valid JSON.");
-			setLoading(false);
-			return;
-		}
+	// --- HANDLERS ---
 
-		const newPath = path === "/" ? `/${addId}` : `${path}/${addId}`;
-		set(ref(db, newPath), finalVal)
-			.then(() => {
-				setAddStatus(null);
-				setIsAdding(false);
-				setRefreshTrigger((t) => t + 1);
-			})
-			.catch((e) => {
-				setAddStatus(`Add failed: ${e.message}`);
-			})
-			.finally(() => setLoading(false));
-	}, [db, path, addId, addValue]);
+	const openExternalEditor = async (filePath: string) => {
+		// Try opening with VS Code first, then fall back to system default
+		// We use 'code' command for VS Code.
+		exec(`code "${filePath.replace(/\\/g, "\\\\")}"`, (error) => {
+			if (error) {
+				// Fallback for Windows
+				exec(`start "" "${filePath.replace(/\\/g, "\\\\")}"`);
+			}
+		});
+	};
+
+	const handleExternalEditStart = async () => {
+		if (mode !== "BROWSE" || !data) return;
+		try {
+			setMode("LOADING");
+			setStatusMessage("Preparing external edit...");
+
+			const timestamp = Date.now();
+			const fileName = `temp_edit_${timestamp}.json`;
+			const filePath = resolve(process.cwd(), fileName);
+
+			// Format JSON for editing
+			await writeFile(filePath, JSON.stringify(data, null, 2));
+			setTempFilePath(filePath);
+
+			openExternalEditor(filePath);
+
+			setMode("EXTERNAL_EDIT_WAIT");
+			setStatusMessage(
+				`Editing ${fileName}. Save and close editor, then press ENTER.`
+			);
+		} catch (e: any) {
+			setStatusMessage(`Failed to start external edit: ${e.message}`);
+			setMode("BROWSE");
+		}
+	};
+
+	const handleExternalEditFinish = async () => {
+		if (!tempFilePath) return;
+		try {
+			setMode("LOADING");
+			setStatusMessage("Fetching latest data and calculating diffs...");
+
+			// 1. Read file
+			const fileContent = await readFile(tempFilePath, "utf-8");
+			let newItem: any;
+			try {
+				newItem = JSON.parse(fileContent);
+			} catch (parseError) {
+				setStatusMessage("Error parsing JSON file. Please fix syntax.");
+				setMode("EXTERNAL_EDIT_WAIT");
+				return;
+			}
+
+			// 2. Fetch fresh DB data
+			const snapshot = await get(ref(db, path === "/" ? "/" : path));
+			const currentDbData = snapshot.exists() ? snapshot.val() : null;
+
+			// 3. Diff
+			// If both are primitives, simple check.
+			// Using our diff utility
+			const calculatedDiffs = calculateDiff(currentDbData, newItem);
+
+			if (calculatedDiffs.length === 0) {
+				setStatusMessage("No changes detected.");
+				setMode("BROWSE");
+				// Clean up file
+				try {
+					await unlink(tempFilePath);
+				} catch {}
+				setTempFilePath(null);
+			} else {
+				setDiffs(calculatedDiffs);
+				setDiffCursor(0);
+				setMode("DIFF_REVIEW");
+				setStatusMessage(null);
+			}
+		} catch (e: any) {
+			setStatusMessage(`Error processing edit: ${e.message}`);
+			setMode("BROWSE");
+		}
+	};
+
+	const applyDiffs = async () => {
+		setMode("LOADING");
+		setStatusMessage("Applying changes...");
+		try {
+			// Filter selected diffs
+			const selectedDiffs = diffs.filter((d) => d.selected);
+
+			if (selectedDiffs.length === 0) {
+				setStatusMessage("No changes selected.");
+				setMode("BROWSE");
+				return;
+			}
+
+			const updatePayload: Record<string, any> = {};
+			for (const diff of selectedDiffs) {
+				const relativePath = diff.path.join("/");
+				if (diff.type === "DELETE") {
+					updatePayload[relativePath] = null;
+				} else {
+					updatePayload[relativePath] = diff.newValue;
+				}
+			}
+
+			await update(ref(db, path === "/" ? "/" : path), updatePayload);
+
+			// Clean/Success
+			try {
+				if (tempFilePath) await unlink(tempFilePath);
+			} catch {}
+			setTempFilePath(null);
+			setDiffs([]);
+			setStatusMessage("Changes applied successfully!");
+			setRefreshTrigger((t) => t + 1); // Triggers loading/browse
+		} catch (e: any) {
+			setStatusMessage(`Failed to apply changes: ${e.message}`);
+			setMode("BROWSE");
+		}
+	};
+
+	// --- INPUT HANDLING ---
 
 	useInput((input, key) => {
-		// Disable global navigation keys while editing or adding
-		if (isEditing) {
-			// Allow Escape to cancel editing
+		if (mode === "LOADING") return;
+
+		// --- BROWSE MODE ---
+		if (mode === "BROWSE") {
+			// Navigation - go back (backspace or delete or escape)
+			if ((key.backspace || key.delete || key.escape) && path !== "/") {
+				const parts = path.split("/").filter((p) => p);
+				parts.pop();
+				setPath(parts.length === 0 ? "/" : "/" + parts.join("/"));
+				return;
+			}
+
+			// Add
+			if (input === "a") {
+				setMode("ADD_ID");
+				// Setup inference
+				let keys: string[] = [];
+				let values: any[] = [];
+				if (data && typeof data === "object") {
+					keys = Object.keys(data);
+					values = Object.values(data);
+				}
+				setAddId(inferNextId(keys));
+				const schemas = inferSchema(values);
+				setAvailableSchemas(schemas);
+				setCurrentSchemaIndex(0);
+				setAddValue(JSON.stringify(schemas[0] || {}));
+				setStatusMessage(null);
+				return;
+			}
+
+			// Edit primitive
+			if (input === "e" && data !== null && typeof data !== "object") {
+				setMode("EDIT_PRIMITIVE");
+				setEditValue(String(data));
+				setStatusMessage(null);
+				return;
+			}
+
+			// Delete (r)
+			if (
+				input === "r" &&
+				highlightedItem &&
+				data &&
+				typeof data === "object"
+			) {
+				setMode("DELETE_CONFIRM");
+				setItemToDelete(highlightedItem);
+				setStatusMessage(null);
+				return;
+			}
+
+			// Dump / Export
+			if (input === "d") {
+				setMode("DUMPING");
+				setStatusMessage("Dumping data...");
+				const rootRef = ref(db, "/");
+				get(rootRef)
+					.then(async (s) => {
+						if (s.exists()) {
+							const fName = `dump-${Date.now()}.json`;
+							await writeFile(fName, JSON.stringify(s.val(), null, 2));
+							setStatusMessage(`Dump saved to ${fName}`);
+						} else {
+							setStatusMessage("Root is empty.");
+						}
+						setMode("BROWSE");
+					})
+					.catch((e) => {
+						setStatusMessage("Dump failed: " + e.message);
+						setMode("BROWSE");
+					});
+				return;
+			}
+
+			// External Edit (f)
+			if (input === "f") {
+				handleExternalEditStart();
+				return;
+			}
+
+			// Set preferred preview field (g)
+			// When inside an object, pressing "g" sets the currently highlighted field
+			// as the preferred preview for the PARENT path (so sibling objects show this field)
+			if (
+				input === "g" &&
+				path !== "/" &&
+				highlightedItem &&
+				data &&
+				typeof data === "object"
+			) {
+				// Get parent path
+				const parts = path.split("/").filter((p) => p);
+				parts.pop(); // Remove current segment
+				const parentPath = parts.length === 0 ? "/" : "/" + parts.join("/");
+
+				// The highlighted item is a field name in the current object
+				// Set it as the preferred preview field for the parent path
+				setPreferredPreviewFields((prev) => ({
+					...prev,
+					[parentPath]: highlightedItem,
+				}));
+				setStatusMessage(
+					`Preview field set to "${highlightedItem}" for ${parentPath}`
+				);
+				return;
+			}
+
+			return;
+		}
+
+		// --- ADD MODES ---
+		if (mode === "ADD_ID") {
 			if (key.escape) {
-				setIsEditing(false);
-				setWriteStatus(null);
+				setMode("BROWSE");
+				return;
 			}
-			return;
+			return; // Handled by TextInput onSubmit
 		}
-
-		if (isAdding) {
+		if (mode === "ADD_VALUE") {
 			if (key.escape) {
-				setIsAdding(false);
-				setAddStatus(null);
+				setMode("BROWSE");
+				return;
 			}
-			return;
-		}
-
-		// Edit mode toggle (only for leaf nodes)
-		if (
-			input === "e" &&
-			!loading &&
-			data !== null &&
-			typeof data !== "object"
-		) {
-			setIsEditing(true);
-			setEditValue(String(data));
-			setWriteStatus(null);
-			return;
-		}
-
-		// Add mode toggle
-		if (input === "a" && !loading && !isEditing && !dumping) {
-			setIsAdding(true);
-			setAddStep("id");
-			setAddStatus(null);
-
-			// Logic to infer ID and Schema
-			let keys: string[] = [];
-			let values: any[] = [];
-
-			if (data && typeof data === "object") {
-				keys = Object.keys(data);
-				values = Object.values(data);
+			if (key.tab && availableSchemas.length > 1) {
+				const next = (currentSchemaIndex + 1) % availableSchemas.length;
+				setCurrentSchemaIndex(next);
+				setAddValue(JSON.stringify(availableSchemas[next] || {}));
 			}
-
-			const nextId = inferNextId(keys);
-			setAddId(nextId);
-
-			const schemas = inferSchema(values);
-			setAvailableSchemas(schemas);
-			setCurrentSchemaIndex(0);
-
-			// Default to empty object if schema is empty/null, or JSON string of it
-			setAddValue(JSON.stringify(schemas[0] || {}));
-			return;
+			return; // Handled by TextInput onSubmit
 		}
 
-		// Cycle Schemas
-		if (
-			isAdding &&
-			addStep === "value" &&
-			key.tab &&
-			availableSchemas.length > 1
-		) {
-			const nextIndex = (currentSchemaIndex + 1) % availableSchemas.length;
-			setCurrentSchemaIndex(nextIndex);
-			setAddValue(JSON.stringify(availableSchemas[nextIndex] || {}));
-			return;
+		// --- EDIT PRIMITIVE ---
+		if (mode === "EDIT_PRIMITIVE") {
+			if (key.escape) {
+				setMode("BROWSE");
+				return;
+			}
+			return; // Handled by TextInput
 		}
 
-		// Deletion
-		if (
-			key.delete &&
-			!isAdding &&
-			!isEditing &&
-			!dumping &&
-			highlightedItem &&
-			data &&
-			typeof data === "object"
-		) {
-			const itemPath =
-				path === "/" ? `/${highlightedItem}` : `${path}/${highlightedItem}`;
-			set(ref(db, itemPath), null)
-				.then(() => {
-					setDeleteStatus(`Deleted ${highlightedItem}`);
-					// Clean up immediately? Listener should handle it.
-				})
-				.catch((e) => {
-					setDeleteStatus(`Delete failed: ${e.message}`);
-				});
-			return;
-		}
-		// Dump logic
-		if (input === "d" && !dumping && !loading) {
-			setDumping(true);
-			setDumpStatus("Fetching full database dump...");
-
-			const rootRef = ref(db, "/");
-			get(rootRef)
-				.then(async (snapshot) => {
-					if (snapshot.exists()) {
-						const val = snapshot.val();
-						const timestamp = Date.now();
-						const filename = `dump-${timestamp}.json`;
-						await writeFile(filename, JSON.stringify(val, null, 2));
-						setDumpStatus(`Dump saved to ${filename}`);
-					} else {
-						setDumpStatus("Nothing to dump (root is empty).");
-					}
-				})
-				.catch((err) => {
-					setDumpStatus(`Dump failed: ${err.message}`);
-				})
-				.finally(() => {
-					setDumping(false);
-				});
-			return;
+		// --- DELETE CONFIRM ---
+		if (mode === "DELETE_CONFIRM") {
+			// Confirm with Enter or y
+			if (key.return || input === "y") {
+				if (!itemToDelete) {
+					setMode("BROWSE");
+					return;
+				}
+				setMode("LOADING");
+				const itemPath =
+					path === "/" ? `/${itemToDelete}` : `${path}/${itemToDelete}`;
+				set(ref(db, itemPath), null)
+					.then(() => {
+						setStatusMessage(`Deleted ${itemToDelete}`);
+						setRefreshTrigger((t) => t + 1);
+					})
+					.catch((e) => {
+						setStatusMessage(`Delete failed: ${e.message}`);
+						setMode("BROWSE");
+					});
+				return;
+			}
+			// Cancel with Esc or n
+			if (key.escape || input === "n") {
+				setMode("BROWSE");
+				setStatusMessage("Deletion cancelled.");
+				return;
+			}
 		}
 
-		// Back navigation
-		if (key.backspace && path !== "/") {
-			const parts = path.split("/").filter((p) => p);
-			parts.pop();
-			setPath(parts.length === 0 ? "/" : "/" + parts.join("/"));
+		// --- EXTERNAL EDIT WAIT ---
+		if (mode === "EXTERNAL_EDIT_WAIT") {
+			if (key.return) {
+				handleExternalEditFinish();
+			}
+			if (key.escape) {
+				setMode("BROWSE");
+				setStatusMessage("Edit cancelled.");
+				// Try cleanup?
+			}
 		}
-		// Quit on Ctrl+C is handled by ink default, but Escape could be "Back" too?
-		if (key.escape && path !== "/") {
-			const parts = path.split("/").filter((p) => p);
-			parts.pop();
-			setPath(parts.length === 0 ? "/" : "/" + parts.join("/"));
+
+		// --- DIFF REVIEW ---
+		if (mode === "DIFF_REVIEW") {
+			if (key.upArrow) {
+				setDiffCursor((c) => Math.max(0, c - 1));
+			}
+			if (key.downArrow) {
+				setDiffCursor((c) => Math.min(diffs.length - 1, c + 1));
+			}
+			if (input === " " || key.rightArrow || key.leftArrow) {
+				// Toggle
+				const newDiffs = [...diffs];
+				const target = newDiffs[diffCursor];
+				if (target) {
+					target.selected = !target.selected;
+					setDiffs(newDiffs);
+				}
+			}
+			if (key.return) {
+				// Go to confirmation step
+				setMode("DIFF_APPLY_CONFIRM");
+			}
+			if (key.escape) {
+				setMode("BROWSE");
+				setStatusMessage("Review cancelled. No changes applied.");
+			}
+		}
+
+		// --- DIFF APPLY CONFIRM ---
+		if (mode === "DIFF_APPLY_CONFIRM") {
+			if (key.return || input === "y") {
+				applyDiffs();
+			}
+			if (key.escape || input === "n") {
+				setMode("DIFF_REVIEW");
+				setStatusMessage("Returned to diff review.");
+			}
 		}
 	});
 
-	const handleSelect = (item: { label: string; value: string }) => {
-		// Cleanly construct path
-		const newPath = path === "/" ? `/${item.value}` : `${path}/${item.value}`;
-		setPath(newPath);
-	};
+	// --- RENDERING ---
 
-	// Prepare list items
+	// Helper function to format a preview value
+	const formatPreview = useCallback(
+		(val: any, maxLength: number = 40): string => {
+			if (val === null) return "null";
+			if (val === undefined) return "undefined";
+
+			const type = typeof val;
+
+			if (type === "string") {
+				if (val.length > maxLength) {
+					return `"${val.substring(0, maxLength - 3)}..."`;
+				}
+				return `"${val}"`;
+			}
+
+			if (type === "number") {
+				return String(val);
+			}
+
+			if (type === "boolean") {
+				return val ? "✓ true" : "✗ false";
+			}
+
+			if (Array.isArray(val)) {
+				if (val.length === 0) return "[]";
+				// Show first few items or count
+				const preview = val
+					.slice(0, 3)
+					.map((item) => {
+						if (typeof item === "string") return `"${item.substring(0, 10)}"`;
+						if (typeof item === "object") return "{...}";
+						return String(item);
+					})
+					.join(", ");
+				if (val.length > 3) {
+					return `[${preview}, ...+${val.length - 3}]`;
+				}
+				return `[${preview}]`;
+			}
+
+			if (type === "object") {
+				const keys = Object.keys(val);
+				if (keys.length === 0) return "{}";
+				return `{${keys.length} keys}`;
+			}
+
+			return String(val);
+		},
+		[]
+	);
+
+	// Get the preferred preview field for the current path
+	const currentPreferredField = useMemo(() => {
+		return preferredPreviewFields[path] || null;
+	}, [path, preferredPreviewFields]);
+
+	// Helper for SelectInput
 	const items = useMemo(() => {
 		if (!data || typeof data !== "object") return [];
-
 		return Object.keys(data).map((key) => {
 			const val = data[key];
 			const type = typeof val;
-			const isObj = type === "object" && val !== null;
-			// Truncate value preview
+
+			// Determine the preview to show
 			let preview = "";
-			if (!isObj) {
-				preview = String(val).substring(0, 30);
+
+			if (type === "object" && val !== null && !Array.isArray(val)) {
+				// For objects, use preferred preview field if set
+				if (currentPreferredField && val[currentPreferredField] !== undefined) {
+					preview = formatPreview(val[currentPreferredField], 30);
+				} else {
+					// Default: try common fields like name, title, id
+					const commonFields = ["name", "title", "label", "id", "key", "value"];
+					let found = false;
+					for (const field of commonFields) {
+						if (val[field] !== undefined) {
+							preview = formatPreview(val[field], 30);
+							found = true;
+							break;
+						}
+					}
+					if (!found) {
+						preview = formatPreview(val, 30);
+					}
+				}
 			} else {
-				preview = "{...}";
+				// For primitives and arrays, show the value directly
+				preview = formatPreview(val, 35);
 			}
 
+			const typeLabel = Array.isArray(val)
+				? "array"
+				: type === "object" && val === null
+				? "null"
+				: type;
+
 			return {
-				label: `${key}  |  ${
-					type === "object" && val === null ? "null" : type
-				} ${preview}`,
+				label: `${key}  │  ${typeLabel}  │  ${preview}`,
 				value: key,
 			};
 		});
-	}, [data]);
+	}, [data, mode, currentPreferredField, formatPreview]);
 
 	return (
 		<Box
 			flexDirection="column"
 			padding={1}
 			borderStyle="round"
-			borderColor="yellow"
-			width={80}
+			borderColor={
+				mode === "EXTERNAL_EDIT_WAIT"
+					? "magenta"
+					: mode === "DIFF_REVIEW"
+					? "blue"
+					: mode === "DELETE_CONFIRM"
+					? "red"
+					: "yellow"
+			}
+			width={120}
 		>
-			<Box marginBottom={1}>
-				<Text bold color="cyan">
-					RESPLOIT EXPLORER
-				</Text>
-				<Text> | </Text>
-				<Text color="yellow">{path}</Text>
-				{dumping && <Text color="magenta"> | DUMPING...</Text>}
-				{isAdding && <Text color="green"> | ADDING...</Text>}
+			<Box marginBottom={1} justifyContent="space-between">
+				<Box>
+					<Text bold color="cyan">
+						DB EXPLORER
+					</Text>
+					<Text> | </Text>
+					<Text color="yellow">{path}</Text>
+					{currentPreferredField && (
+						<>
+							<Text> | </Text>
+							<Text color="magenta">Preview: {currentPreferredField}</Text>
+						</>
+					)}
+				</Box>
+				<Box>
+					<Text color="gray">Mode: {mode}</Text>
+				</Box>
 			</Box>
 
-			{loading && (
-				<Box>
-					<Text color="green">
-						<Spinner type="dots" /> Loading...
+			{statusMessage && (
+				<Box marginBottom={1}>
+					<Text color="yellow">{statusMessage}</Text>
+				</Box>
+			)}
+
+			{/* CONTENT AREA */}
+			{mode === "LOADING" && (
+				<Text color="green">
+					<Spinner type="dots" /> Loading...
+				</Text>
+			)}
+
+			{mode === "BROWSE" && error && <Text color="red">Error: {error}</Text>}
+
+			{mode === "BROWSE" && !error && data === null && (
+				<Box flexDirection="column">
+					<Text italic color="gray">
+						No data at this location.
+					</Text>
+					<Text color="gray">Press 'a' to add data, 'f' to edit via file.</Text>
+				</Box>
+			)}
+
+			{/* Primitive View */}
+			{mode === "BROWSE" && data !== null && typeof data !== "object" && (
+				<Box flexDirection="column">
+					<Text bold>Value:</Text>
+					<Text color="green">{String(data)}</Text>
+					<Box height={1} />
+					<Text color="gray">
+						Back: BS. Edit: 'e'. Dump: 'd'. File Edit: 'f'.
 					</Text>
 				</Box>
 			)}
 
-			{isAdding && !loading && (
+			{/* Object View */}
+			{mode === "BROWSE" && data !== null && typeof data === "object" && (
+				<Box flexDirection="column">
+					{items.length === 0 ? (
+						<Text italic>Empty object.</Text>
+					) : (
+						<SelectInput
+							items={items}
+							onSelect={(item) =>
+								setPath(
+									path === "/" ? `/${item.value}` : `${path}/${item.value}`
+								)
+							}
+							onHighlight={(item) => setHighlightedItem(item.value)}
+							limit={15}
+						/>
+					)}
+					<Box height={1} />
+					<Text color="gray">
+						Nav: ↑↓/Enter/BS. Add: 'a'. Edit(File): 'f'. Del: 'r'. Dump: 'd'.
+						Preview: 'g'.
+					</Text>
+				</Box>
+			)}
+
+			{/* Add ID */}
+			{mode === "ADD_ID" && (
+				<Box flexDirection="column">
+					<Text>Enter Key/ID:</Text>
+					<TextInput
+						value={addId}
+						onChange={setAddId}
+						onSubmit={() => {
+							if (addId) setMode("ADD_VALUE");
+						}}
+					/>
+					<Text color="gray">Esc to cancel.</Text>
+				</Box>
+			)}
+
+			{/* Add Value */}
+			{mode === "ADD_VALUE" && (
+				<Box flexDirection="column">
+					<Text>Enter Value (JSON):</Text>
+					<TextInput
+						value={addValue}
+						onChange={setAddValue}
+						onSubmit={() => {
+							try {
+								const val = JSON.parse(addValue);
+								setMode("LOADING");
+								const newPath = path === "/" ? `/${addId}` : `${path}/${addId}`;
+								set(ref(db, newPath), val)
+									.then(() => {
+										setStatusMessage("Item added.");
+										setRefreshTrigger((t) => t + 1);
+									})
+									.catch((e) => {
+										setStatusMessage("Error: " + e.message);
+										setMode("BROWSE");
+									});
+							} catch {
+								setStatusMessage("Invalid JSON.");
+							}
+						}}
+					/>
+					{availableSchemas.length > 1 && (
+						<Text color="gray">
+							Tab to cycle schemas ({currentSchemaIndex + 1}/
+							{availableSchemas.length})
+						</Text>
+					)}
+					<Text color="gray">Esc to cancel.</Text>
+				</Box>
+			)}
+
+			{/* Edit Primitive */}
+			{mode === "EDIT_PRIMITIVE" && (
+				<Box flexDirection="column">
+					<Text>Edit Value:</Text>
+					<TextInput
+						value={editValue}
+						onChange={setEditValue}
+						onSubmit={(val) => {
+							let finalVal: any = val;
+							try {
+								finalVal = JSON.parse(val);
+							} catch {}
+							setMode("LOADING");
+							set(ref(db, path), finalVal)
+								.then(() => {
+									setStatusMessage("Updated.");
+									setRefreshTrigger((t) => t + 1);
+								})
+								.catch((e) => {
+									setStatusMessage("Update failed: " + e.message);
+									setMode("BROWSE");
+								});
+						}}
+					/>
+				</Box>
+			)}
+
+			{/* Delete Confirm */}
+			{mode === "DELETE_CONFIRM" && (
+				<Box
+					flexDirection="column"
+					borderColor="red"
+					borderStyle="single"
+					padding={1}
+				>
+					<Text bold color="red">
+						WARNING: Deleting {itemToDelete}
+					</Text>
+					<Text>
+						Are you sure you want to delete this item? This cannot be undone.
+					</Text>
+					<Box height={1} />
+					<Text bold>Press 'y' or ENTER to confirm.</Text>
+					<Text>Press 'n' or ESC to cancel.</Text>
+				</Box>
+			)}
+
+			{/* External Edit Wait */}
+			{mode === "EXTERNAL_EDIT_WAIT" && (
+				<Box flexDirection="column" alignItems="center">
+					<Text bold color="magenta">
+						External Editing Active
+					</Text>
+					<Text>Your default editor should have opened.</Text>
+					<Text>1. Edit the file: {tempFilePath}</Text>
+					<Text>2. Save and Close the file.</Text>
+					<Text>3. Press ENTER here to review changes.</Text>
+				</Box>
+			)}
+
+			{/* Diff Review */}
+			{mode === "DIFF_REVIEW" && (
+				<Box flexDirection="column">
+					<Text bold underline>
+						Review Changes ({diffs.filter((d) => d.selected).length}/
+						{diffs.length} selected)
+					</Text>
+					{diffs.map((diff, idx) => (
+						<Box key={idx}>
+							<Text color={idx === diffCursor ? "cyan" : "white"}>
+								{`${diff.selected ? "[x]" : "[ ]"} ${
+									idx === diffCursor ? "> " : "  "
+								}`}
+							</Text>
+							<Text
+								color={
+									diff.type === "CREATE"
+										? "green"
+										: diff.type === "DELETE"
+										? "red"
+										: "yellow"
+								}
+							>
+								{diff.type} {diff.path.join("/")}
+							</Text>
+							{diff.type === "EDIT" && (
+								<Text color="gray">
+									{(JSON.stringify(diff.oldValue) ?? "undefined").substring(
+										0,
+										20
+									)}{" "}
+									-{">"}{" "}
+									{(JSON.stringify(diff.newValue) ?? "undefined").substring(
+										0,
+										20
+									)}
+								</Text>
+							)}
+						</Box>
+					))}
+					<Box height={1} />
+					<Text color="gray">
+						Space: Toggle. Enter: Confirm & Apply. Esc: Cancel.
+					</Text>
+				</Box>
+			)}
+
+			{/* Diff Apply Confirm */}
+			{mode === "DIFF_APPLY_CONFIRM" && (
 				<Box
 					flexDirection="column"
 					borderColor="green"
-					borderStyle="round"
+					borderStyle="single"
 					padding={1}
 				>
-					<Text bold underline>
-						Add New Item
+					<Text bold color="green">
+						CONFIRM CHANGES
 					</Text>
-					{addStep === "id" ? (
-						<Box>
-							<Text>ID: </Text>
-							<TextInput
-								value={addId}
-								onChange={setAddId}
-								onSubmit={() => setAddStep("value")}
-							/>
-						</Box>
-					) : (
-						<Box flexDirection="column">
-							<Box>
-								<Text>Value (JSON): </Text>
-								<TextInput
-									value={addValue}
-									onChange={setAddValue}
-									onSubmit={handleAddSubmit}
-								/>
-							</Box>
-							<Text color="gray">
-								{availableSchemas.length > 1
-									? `Detected Schema ${currentSchemaIndex + 1}/${
-											availableSchemas.length
-									  } (Tab to cycle).`
-									: "Detected Schema used as default."}
-							</Text>
-						</Box>
-					)}
+					<Text>
+						You are about to apply {diffs.filter((d) => d.selected).length}{" "}
+						change(s):
+					</Text>
 					<Box height={1} />
-					<Text color="gray">Press Enter to confirm, Esc to cancel.</Text>
-					{addStatus && <Text color="red">{addStatus}</Text>}
+					{diffs
+						.filter((d) => d.selected)
+						.map((diff, idx) => (
+							<Text
+								key={idx}
+								color={
+									diff.type === "CREATE"
+										? "green"
+										: diff.type === "DELETE"
+										? "red"
+										: "yellow"
+								}
+							>
+								• {diff.type}: {diff.path.join("/")}
+							</Text>
+						))}
+					<Box height={1} />
+					<Text bold>Press 'y' or ENTER to apply changes.</Text>
+					<Text>Press 'n' or ESC to go back to review.</Text>
 				</Box>
 			)}
-
-			{isAdding ? null : (
-				<>
-					{dumpStatus && (
-						<Box
-							marginBottom={1}
-							borderStyle="single"
-							borderColor={dumpStatus.includes("failed") ? "red" : "green"}
-						>
-							<Text
-								bold
-								color={dumpStatus.includes("failed") ? "red" : "green"}
-							>
-								{dumpStatus}
-							</Text>
-						</Box>
-					)}
-
-					{deleteStatus && (
-						<Box marginBottom={1}>
-							<Text color="red">{deleteStatus}</Text>
-						</Box>
-					)}
-
-					{error && (
-						<Box>
-							<Text color="red" bold>
-								Error: {error}
-							</Text>
-						</Box>
-					)}
-
-					{!loading && !error && data === null && (
-						<Box flexDirection="column">
-							<Text italic color="gray">
-								No data at this location.
-							</Text>
-							<Text color="gray">Press 'a' to add data here.</Text>
-						</Box>
-					)}
-				</>
-			)}
-
-			{!isAdding &&
-				!loading &&
-				!error &&
-				data !== null &&
-				typeof data !== "object" && (
-					<Box flexDirection="column">
-						<Text bold underline>
-							Value:
-						</Text>
-						{isEditing ? (
-							<Box flexDirection="column">
-								<Box>
-									<Text color="green">{"> "}</Text>
-									<TextInput
-										value={editValue}
-										onChange={setEditValue}
-										onSubmit={(val) => {
-											setLoading(true);
-											// Try to parse as JSON first (to support numbers, booleans, quoted strings)
-											let finalVal: any = val;
-											try {
-												finalVal = JSON.parse(val);
-											} catch {
-												// Keep as string
-											}
-
-											set(ref(db, path), finalVal)
-												.then(() => {
-													setWriteStatus("Value updated successfully!");
-													setIsEditing(false);
-													setData(finalVal);
-												})
-												.catch((e) => {
-													setWriteStatus(`Update failed: ${e.message}`);
-													setIsEditing(false);
-												})
-												.finally(() => setLoading(false));
-										}}
-									/>
-								</Box>
-								<Text color="gray">Press Enter to save, Esc to cancel.</Text>
-							</Box>
-						) : (
-							<Text color="green">{String(data)}</Text>
-						)}
-
-						<Box height={1} />
-						{writeStatus && (
-							<Text color={writeStatus.includes("failed") ? "red" : "green"}>
-								{writeStatus}
-							</Text>
-						)}
-						<Text color="gray">
-							Press Backspace to go back. 'd' to dump all. 'e' to edit.
-						</Text>
-					</Box>
-				)}
-
-			{!isAdding &&
-				!loading &&
-				!error &&
-				typeof data === "object" &&
-				data !== null && (
-					<Box flexDirection="column">
-						{items.length === 0 ? (
-							<Text italic>Empty object.</Text>
-						) : (
-							<>
-								<Box marginBottom={1}>
-									<Text bold>Keys ({items.length}):</Text>
-								</Box>
-								<SelectInput
-									items={items}
-									onSelect={handleSelect}
-									onHighlight={(item) => setHighlightedItem(item.value)}
-									limit={10}
-								/>
-							</>
-						)}
-						<Box height={1} />
-						<Box height={1} />
-						<Text color="gray">
-							Enter to explore. Backspace to go up. 'a' to add. 'd' to dump. Del
-							to delete.
-						</Text>
-					</Box>
-				)}
 		</Box>
 	);
 }
