@@ -9,9 +9,12 @@ import { exec } from "child_process";
 import { resolve } from "path";
 import { inferNextId, inferSchema } from "./schemaUtils.ts";
 import { calculateDiff, type DiffChange } from "./diffUtils.ts";
+import { recordingManager } from "./RecordingManager.ts";
+import type { PlayMode } from "./recordingTypes.ts";
 
 interface ExplorerProps {
 	db: Database;
+	onStartPlayback?: (filePath: string) => void;
 }
 
 type ExplorerMode =
@@ -24,9 +27,12 @@ type ExplorerMode =
 	| "EXTERNAL_EDIT_WAIT"
 	| "DIFF_REVIEW"
 	| "DIFF_APPLY_CONFIRM"
-	| "LOADING";
+	| "LOADING"
+	| "RECORDING_CONFIG"
+	| "EXPORT_RECORDING"
+	| "LOAD_RECORDING";
 
-export default function Explorer({ db }: ExplorerProps) {
+export default function Explorer({ db, onStartPlayback }: ExplorerProps) {
 	// Navigation & Data
 	const [path, setPath] = useState<string>("/");
 	const [data, setData] = useState<any>(undefined);
@@ -62,6 +68,17 @@ export default function Explorer({ db }: ExplorerProps) {
 	const [preferredPreviewFields, setPreferredPreviewFields] = useState<
 		Record<string, string>
 	>({});
+
+	// Recording state
+	const [isRecording, setIsRecording] = useState(false);
+	const [exportFileName, setExportFileName] = useState("");
+	const [loadFilePath, setLoadFilePath] = useState("");
+	const [recordingPlayMode, setRecordingPlayMode] =
+		useState<PlayMode>("normal");
+	const [recordingConfirm, setRecordingConfirm] = useState(true);
+	const [recordingAutoSleep, setRecordingAutoSleep] = useState("500");
+	const [recordingTimeout, setRecordingTimeout] = useState("30");
+	const [recordingConfigStep, setRecordingConfigStep] = useState(0);
 
 	// --- IDLE/LOADING LOGIC ---
 
@@ -340,6 +357,34 @@ export default function Explorer({ db }: ExplorerProps) {
 				return;
 			}
 
+			// Start Recording (q)
+			if (input === "q" && !isRecording) {
+				setMode("RECORDING_CONFIG");
+				setRecordingConfigStep(0);
+				setRecordingPlayMode("normal");
+				setRecordingConfirm(true);
+				setRecordingAutoSleep("500");
+				setRecordingTimeout("30");
+				setStatusMessage(null);
+				return;
+			}
+
+			// Stop Recording and Export (w)
+			if (input === "w" && isRecording) {
+				setMode("EXPORT_RECORDING");
+				setExportFileName(`recording-${Date.now()}.rlsactions`);
+				setStatusMessage(null);
+				return;
+			}
+
+			// Load Recording (l)
+			if (input === "l") {
+				setMode("LOAD_RECORDING");
+				setLoadFilePath("");
+				setStatusMessage(null);
+				return;
+			}
+
 			return;
 		}
 
@@ -386,6 +431,10 @@ export default function Explorer({ db }: ExplorerProps) {
 					path === "/" ? `/${itemToDelete}` : `${path}/${itemToDelete}`;
 				set(ref(db, itemPath), null)
 					.then(() => {
+						// Record the delete action
+						if (isRecording) {
+							recordingManager.recordDelete(itemPath);
+						}
 						setStatusMessage(`Deleted ${itemToDelete}`);
 						setRefreshTrigger((t) => t + 1);
 					})
@@ -451,6 +500,57 @@ export default function Explorer({ db }: ExplorerProps) {
 				setMode("DIFF_REVIEW");
 				setStatusMessage("Returned to diff review.");
 			}
+		}
+
+		// --- RECORDING CONFIG ---
+		if (mode === "RECORDING_CONFIG") {
+			if (key.escape) {
+				setMode("BROWSE");
+				setStatusMessage("Recording cancelled.");
+				return;
+			}
+			// Step 0: Play Mode selection
+			if (recordingConfigStep === 0) {
+				if (key.leftArrow || key.rightArrow || input === " ") {
+					setRecordingPlayMode((m) => (m === "normal" ? "loop" : "normal"));
+				}
+				if (key.return) {
+					setRecordingConfigStep(1);
+				}
+				return;
+			}
+			// Step 1: Confirm for edit/delete
+			if (recordingConfigStep === 1) {
+				if (key.leftArrow || key.rightArrow || input === " ") {
+					setRecordingConfirm((c) => !c);
+				}
+				if (key.return) {
+					setRecordingConfigStep(2);
+				}
+				return;
+			}
+			// Step 2: Auto sleep (handled by TextInput)
+			// Step 3: Timeout (handled by TextInput)
+		}
+
+		// --- EXPORT RECORDING ---
+		if (mode === "EXPORT_RECORDING") {
+			if (key.escape) {
+				setMode("BROWSE");
+				setStatusMessage("Export cancelled. Recording continues.");
+				return;
+			}
+			// Handled by TextInput
+		}
+
+		// --- LOAD RECORDING ---
+		if (mode === "LOAD_RECORDING") {
+			if (key.escape) {
+				setMode("BROWSE");
+				setStatusMessage("Load cancelled.");
+				return;
+			}
+			// Handled by TextInput
 		}
 	});
 
@@ -565,12 +665,16 @@ export default function Explorer({ db }: ExplorerProps) {
 			padding={1}
 			borderStyle="round"
 			borderColor={
-				mode === "EXTERNAL_EDIT_WAIT"
+				isRecording
+					? "red"
+					: mode === "EXTERNAL_EDIT_WAIT"
 					? "magenta"
 					: mode === "DIFF_REVIEW"
 					? "blue"
 					: mode === "DELETE_CONFIRM"
 					? "red"
+					: mode === "RECORDING_CONFIG"
+					? "magenta"
 					: "yellow"
 			}
 			width={120}
@@ -586,6 +690,14 @@ export default function Explorer({ db }: ExplorerProps) {
 						<>
 							<Text> | </Text>
 							<Text color="magenta">Preview: {currentPreferredField}</Text>
+						</>
+					)}
+					{isRecording && (
+						<>
+							<Text> | </Text>
+							<Text bold color="red">
+								🔴 REC ({recordingManager.actionCount})
+							</Text>
 						</>
 					)}
 				</Box>
@@ -652,6 +764,11 @@ export default function Explorer({ db }: ExplorerProps) {
 						Nav: ↑↓/Enter/BS. Add: 'a'. Edit(File): 'f'. Del: 'r'. Dump: 'd'.
 						Preview: 'g'.
 					</Text>
+					<Text color="gray">
+						{isRecording
+							? "Recording: Stop/Export 'w'."
+							: "Recording: Start 'q'. Load 'l'."}
+					</Text>
 				</Box>
 			)}
 
@@ -684,6 +801,10 @@ export default function Explorer({ db }: ExplorerProps) {
 								const newPath = path === "/" ? `/${addId}` : `${path}/${addId}`;
 								set(ref(db, newPath), val)
 									.then(() => {
+										// Record the edit action
+										if (isRecording) {
+											recordingManager.recordEdit(newPath, val);
+										}
 										setStatusMessage("Item added.");
 										setRefreshTrigger((t) => t + 1);
 									})
@@ -721,6 +842,10 @@ export default function Explorer({ db }: ExplorerProps) {
 							setMode("LOADING");
 							set(ref(db, path), finalVal)
 								.then(() => {
+									// Record the edit action
+									if (isRecording) {
+										recordingManager.recordEdit(path, finalVal);
+									}
 									setStatusMessage("Updated.");
 									setRefreshTrigger((t) => t + 1);
 								})
@@ -848,6 +973,169 @@ export default function Explorer({ db }: ExplorerProps) {
 					<Box height={1} />
 					<Text bold>Press 'y' or ENTER to apply changes.</Text>
 					<Text>Press 'n' or ESC to go back to review.</Text>
+				</Box>
+			)}
+
+			{/* Recording Config */}
+			{mode === "RECORDING_CONFIG" && (
+				<Box
+					flexDirection="column"
+					borderColor="magenta"
+					borderStyle="round"
+					padding={1}
+				>
+					<Text bold color="magenta">
+						🎬 RECORDING CONFIGURATION
+					</Text>
+					<Box height={1} />
+
+					{/* Step 0: Play Mode */}
+					{recordingConfigStep === 0 && (
+						<Box flexDirection="column">
+							<Text>Select Play Mode:</Text>
+							<Box>
+								<Text color={recordingPlayMode === "normal" ? "green" : "gray"}>
+									{recordingPlayMode === "normal" ? "● " : "○ "}normal
+								</Text>
+								<Text> </Text>
+								<Text color={recordingPlayMode === "loop" ? "green" : "gray"}>
+									{recordingPlayMode === "loop" ? "● " : "○ "}loop
+								</Text>
+							</Box>
+							<Box height={1} />
+							<Text color="gray">←/→/SPACE to toggle, ENTER to continue</Text>
+						</Box>
+					)}
+
+					{/* Step 1: Confirm Actions */}
+					{recordingConfigStep === 1 && (
+						<Box flexDirection="column">
+							<Text>Confirm edit/delete actions during playback?</Text>
+							<Box>
+								<Text color={recordingConfirm ? "green" : "gray"}>
+									{recordingConfirm ? "● " : "○ "}Yes
+								</Text>
+								<Text> </Text>
+								<Text color={!recordingConfirm ? "green" : "gray"}>
+									{!recordingConfirm ? "● " : "○ "}No
+								</Text>
+							</Box>
+							<Box height={1} />
+							<Text color="gray">←/→/SPACE to toggle, ENTER to continue</Text>
+						</Box>
+					)}
+
+					{/* Step 2: Auto Sleep */}
+					{recordingConfigStep === 2 && (
+						<Box flexDirection="column">
+							<Text>Auto sleep between actions (ms):</Text>
+							<TextInput
+								value={recordingAutoSleep}
+								onChange={setRecordingAutoSleep}
+								onSubmit={() => setRecordingConfigStep(3)}
+							/>
+							<Text color="gray">Enter a number, then ENTER to continue</Text>
+						</Box>
+					)}
+
+					{/* Step 3: Timeout */}
+					{recordingConfigStep === 3 && (
+						<Box flexDirection="column">
+							<Text>Playback timeout (seconds):</Text>
+							<TextInput
+								value={recordingTimeout}
+								onChange={setRecordingTimeout}
+								onSubmit={() => {
+									// Start recording with configured settings
+									recordingManager.start();
+									recordingManager.updateHeader({
+										playMode: recordingPlayMode,
+										confirmActions: recordingConfirm,
+										autoSleepMs: parseInt(recordingAutoSleep) || 500,
+										timeoutSeconds: parseInt(recordingTimeout) || 30,
+									});
+									setIsRecording(true);
+									setMode("BROWSE");
+									setStatusMessage(
+										"🔴 Recording started! Press 'w' to stop and export."
+									);
+								}}
+							/>
+							<Text color="gray">
+								Enter a number, then ENTER to start recording
+							</Text>
+						</Box>
+					)}
+
+					<Box height={1} />
+					<Text color="gray">ESC to cancel</Text>
+				</Box>
+			)}
+
+			{/* Export Recording */}
+			{mode === "EXPORT_RECORDING" && (
+				<Box
+					flexDirection="column"
+					borderColor="green"
+					borderStyle="round"
+					padding={1}
+				>
+					<Text bold color="green">
+						💾 EXPORT RECORDING
+					</Text>
+					<Text>Recorded {recordingManager.actionCount} action(s)</Text>
+					<Box height={1} />
+					<Text>Enter filename:</Text>
+					<TextInput
+						value={exportFileName}
+						onChange={setExportFileName}
+						onSubmit={async (filename) => {
+							try {
+								const recording = recordingManager.stop();
+								const content = recordingManager.export();
+								await writeFile(filename, content);
+								setIsRecording(false);
+								setStatusMessage(`Recording saved to ${filename}`);
+								setMode("BROWSE");
+							} catch (e: any) {
+								setStatusMessage(`Export failed: ${e.message}`);
+							}
+						}}
+					/>
+					<Box height={1} />
+					<Text color="gray">
+						ENTER to save, ESC to cancel (keep recording)
+					</Text>
+				</Box>
+			)}
+
+			{/* Load Recording */}
+			{mode === "LOAD_RECORDING" && (
+				<Box
+					flexDirection="column"
+					borderColor="cyan"
+					borderStyle="round"
+					padding={1}
+				>
+					<Text bold color="cyan">
+						📂 LOAD RECORDING
+					</Text>
+					<Box height={1} />
+					<Text>Enter .rlsactions file path:</Text>
+					<TextInput
+						value={loadFilePath}
+						onChange={setLoadFilePath}
+						onSubmit={(filePath) => {
+							if (onStartPlayback) {
+								onStartPlayback(filePath);
+							} else {
+								setStatusMessage("Playback not configured.");
+								setMode("BROWSE");
+							}
+						}}
+					/>
+					<Box height={1} />
+					<Text color="gray">ENTER to load, ESC to cancel</Text>
 				</Box>
 			)}
 		</Box>
