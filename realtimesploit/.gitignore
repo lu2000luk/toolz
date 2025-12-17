@@ -4,3 +4,4 @@ dump-*.json
 temp*.json
 *.rlsactions
 exec_*.js
+fire*.json

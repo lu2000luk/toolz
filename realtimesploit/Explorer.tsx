@@ -327,18 +327,31 @@ export default function Explorer({ db, onStartPlayback }: ExplorerProps) {
       const fileName = `exec_target_${timestamp}.js`;
       const filePath = resolve(process.cwd(), fileName);
 
+      let schemaInfo = "// No schema detected (empty or non-object data)";
+      if (data && typeof data === "object") {
+        const values = Object.values(data);
+        const schemas = inferSchema(values);
+        if (schemas.length > 0) {
+          schemaInfo = schemas.map((s) => "// " + JSON.stringify(s)).join("\n");
+        }
+      }
+
       const defaultContent = `// TARGET EXPRESSION
-// Return true to include this item, false to skip.
+// Write a condition that returns true to include this item, false to skip.
 //
 // Available variables:
 //   key: string (the key of the current item)
 //   fields: object (the value of the current item)
 //
-// Example:
-//   return fields["age"] > 18;
-//   return key.startsWith("user_");
+// Detected Schemas:
+${schemaInfo}
+//
+// Examples:
+//   fields["age"] > 18
+//   key.startsWith("user_")
+//   fields["name"] === "test"
 
-return fields["name"] && fields["name"].startsWith("test");
+fields["name"] && fields["name"].startsWith("test")
 `;
       await writeFile(filePath, defaultContent);
       setTempFilePath(filePath);
@@ -377,32 +390,26 @@ return fields["name"] && fields["name"].startsWith("test");
       }
 
       const defaultActionContent = `// ACTION EXPRESSION
-// Return an object where keys are relative paths and values are the new data.
+// Return an array to perform a database operation.
 //
 // Available variables:
 //   key: string (the key of the current item)
 //   fields: object (the value of the current item)
 //
-// Helpers (included below):
-//   Delete(path?) - Returns { [path||""]: null } to delete item or field.
-//   Key(path, data) - Returns { [path]: data } to update specific path.
+// Return formats:
+//   ["DELETE", path]       - Delete the item at path
+//   ["SET", path, data]    - Set data at path
 //
 // Detected Schemas:
 ${schemaInfo}
 
-// --- Helpers ---
-const Delete = (p) => ({ [p || ""]: null });
-const Key = (p, d) => ({ [p]: d });
-// ----------------
-
 // Example Usage:
-// return { name: fields["name"] + "!" }; // Update 'name'
-// return Delete(); // Delete this item
-// return Key("../" + key + "_backup", fields); // Create backup sibling
+// return ["DELETE", key];                              // Delete this item
+// return ["SET", key, { ...fields, name: "updated" }]; // Update this item
+// return ["SET", key + "/name", fields["name"] + "!"];  // Update specific field
+// return ["SET", key + "_backup", fields];              // Create backup
 
-return {
-  name: fields["name"] + "hi"
-};
+return ["SET", key, { ...fields, name: fields["name"] + "hi" }];
 `;
       await writeFile(filePath, defaultActionContent);
       setTempFilePath(filePath);

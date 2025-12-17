@@ -125,7 +125,8 @@ export default function PlaybackMode({ db, recording, onExit }: PlaybackProps) {
       for (const [key, fields] of Object.entries(data)) {
         let isTarget = false;
         try {
-          const fn = new Function("fields", "key", `return ${targetExpr}`);
+          // Target expression is just a condition that returns true/false
+          const fn = new Function("fields", "key", `return (${targetExpr});`);
           isTarget = fn(fields, key);
         } catch (e) {
           // Ignore errors in target eval
@@ -133,32 +134,27 @@ export default function PlaybackMode({ db, recording, onExit }: PlaybackProps) {
 
         if (isTarget) {
           try {
-            const helpers = `
-              const Delete = (p) => ({ [p || ""]: null });
-              const Key = (p, d) => ({ [p]: d });
-            `;
-            const fn = new Function("fields", "key", helpers + actionExpr);
+            // Action expression returns ["DELETE", key] or ["SET", key, data]
+            const fn = new Function("fields", "key", actionExpr);
             const result = fn(fields, key);
 
-            if (result && typeof result === "object") {
-              // Flatten updates to edit actions
-              for (const [fieldKey, fieldValue] of Object.entries(result)) {
-                const fullKey = fieldKey
-                  ? `${path}/${key}/${fieldKey}`
-                  : `${path}/${key}`;
+            if (Array.isArray(result) && result.length >= 2) {
+              const [operation, actionKey, actionData] = result;
+              const fullKey = actionKey.startsWith("/")
+                ? actionKey
+                : `${path}/${actionKey}`;
 
-                if (fieldValue === null) {
-                  generatedActions.push({
-                    type: "delete",
-                    key: fullKey,
-                  });
-                } else {
-                  generatedActions.push({
-                    type: "edit",
-                    key: fullKey,
-                    value: fieldValue,
-                  });
-                }
+              if (operation === "DELETE") {
+                generatedActions.push({
+                  type: "delete",
+                  key: fullKey,
+                });
+              } else if (operation === "SET" && result.length >= 3) {
+                generatedActions.push({
+                  type: "edit",
+                  key: fullKey,
+                  value: actionData,
+                });
               }
             }
           } catch (e) {
