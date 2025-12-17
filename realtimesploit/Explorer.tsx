@@ -24,11 +24,16 @@ import { resolve } from "path";
 import { inferNextId, inferSchema } from "./schemaUtils.ts";
 import { calculateDiff, type DiffChange } from "./diffUtils.ts";
 import { recordingManager } from "./RecordingManager.ts";
-import type { PlayMode } from "./recordingTypes.ts";
+import {
+  DEFAULT_HEADER,
+  serializeRlsActions,
+  type PlayMode,
+  type RecordingFile,
+} from "./recordingTypes.ts";
 
 interface ExplorerProps {
   db: Database;
-  onStartPlayback?: (filePath: string) => void;
+  onStartPlayback: (filePath: string) => void;
 }
 
 type ExplorerMode =
@@ -46,7 +51,10 @@ type ExplorerMode =
   | "EXPORT_RECORDING"
   | "LOAD_RECORDING"
   | "EVENTS"
-  | "EVENT_EDIT_VALUE";
+  | "EVENT_EDIT_VALUE"
+  | "EXEC_TARGET_WAIT"
+  | "EXEC_ACTION_WAIT"
+  | "EXEC_SAVE_CONFIRM";
 
 export default function Explorer({ db, onStartPlayback }: ExplorerProps) {
   // Navigation & Data
@@ -103,6 +111,10 @@ export default function Explorer({ db, onStartPlayback }: ExplorerProps) {
   const [recordingAutoSleep, setRecordingAutoSleep] = useState("500");
   const [recordingTimeout, setRecordingTimeout] = useState("30");
   const [recordingConfigStep, setRecordingConfigStep] = useState(0);
+
+  // Exec State
+  const [execTarget, setExecTarget] = useState("");
+  const [execAction, setExecAction] = useState("");
 
   // --- IDLE/LOADING LOGIC ---
 
@@ -176,13 +188,23 @@ export default function Explorer({ db, onStartPlayback }: ExplorerProps) {
   // --- HANDLERS ---
 
   const openExternalEditor = async (filePath: string) => {
-    // Try opening with VS Code first, then fall back to system default
-    // We use 'code' command for VS Code.
-    exec(`code "${filePath.replace(/\\/g, "\\\\")}"`, (error) => {
-      if (error) {
-        // Fallback for Windows
-        exec(`start "" "${filePath.replace(/\\/g, "\\\\")}"`);
-      }
+    // Try opening with Zed, then VS Code, then Notepad++, then fall back to system default
+    const normalizedPath = filePath.replace(/\\/g, "\\\\");
+    exec(`zed "${normalizedPath}"`, (zedErr) => {
+      if (!zedErr) return;
+      exec(`code "${normalizedPath}"`, (codeErr) => {
+        if (!codeErr) return;
+        exec(`notepad++ "${normalizedPath}"`, (npErr) => {
+          if (!npErr) return;
+          if (process.platform === "win32") {
+            exec(`start "" "${normalizedPath}"`);
+          } else if (process.platform === "darwin") {
+            exec(`open "${normalizedPath}"`);
+          } else {
+            exec(`xdg-open "${normalizedPath}"`);
+          }
+        });
+      });
     });
   };
 
@@ -295,6 +317,157 @@ export default function Explorer({ db, onStartPlayback }: ExplorerProps) {
       setStatusMessage(`Failed to apply changes: ${e.message}`);
       setMode("BROWSE");
     }
+  };
+
+  const handleExecStart = async () => {
+    try {
+      setMode("LOADING");
+      setStatusMessage("Preparing target editor...");
+      const timestamp = Date.now();
+      const fileName = `exec_target_${timestamp}.js`;
+      const filePath = resolve(process.cwd(), fileName);
+
+      const defaultContent = `// TARGET EXPRESSION
+// Return true to include this item, false to skip.
+//
+// Available variables:
+//   key: string (the key of the current item)
+//   fields: object (the value of the current item)
+//
+// Example:
+//   return fields["age"] > 18;
+//   return key.startsWith("user_");
+
+return fields["name"] && fields["name"].startsWith("test");
+`;
+      await writeFile(filePath, defaultContent);
+      setTempFilePath(filePath);
+      openExternalEditor(filePath);
+
+      setMode("EXEC_TARGET_WAIT");
+      setStatusMessage(
+        `Edit TARGET condition in ${fileName}. Save, close, then press ENTER.`,
+      );
+    } catch (e: any) {
+      setStatusMessage(`Error: ${e.message}`);
+      setMode("BROWSE");
+    }
+  };
+
+  const handleExecTargetFinish = async () => {
+    if (!tempFilePath) return;
+    try {
+      const content = await readFile(tempFilePath, "utf-8");
+      setExecTarget(content.trim());
+      await unlink(tempFilePath);
+
+      // Now start Action editor
+      setStatusMessage("Preparing action editor...");
+      const timestamp = Date.now();
+      const fileName = `exec_action_${timestamp}.js`;
+      const filePath = resolve(process.cwd(), fileName);
+
+      let schemaInfo = "// No schema detected (empty or non-object data)";
+      if (data && typeof data === "object") {
+        const values = Object.values(data);
+        const schemas = inferSchema(values);
+        if (schemas.length > 0) {
+          schemaInfo = schemas.map((s) => "// " + JSON.stringify(s)).join("\n");
+        }
+      }
+
+      const defaultActionContent = `// ACTION EXPRESSION
+// Return an object where keys are relative paths and values are the new data.
+//
+// Available variables:
+//   key: string (the key of the current item)
+//   fields: object (the value of the current item)
+//
+// Helpers (included below):
+//   Delete(path?) - Returns { [path||""]: null } to delete item or field.
+//   Key(path, data) - Returns { [path]: data } to update specific path.
+//
+// Detected Schemas:
+${schemaInfo}
+
+// --- Helpers ---
+const Delete = (p) => ({ [p || ""]: null });
+const Key = (p, d) => ({ [p]: d });
+// ----------------
+
+// Example Usage:
+// return { name: fields["name"] + "!" }; // Update 'name'
+// return Delete(); // Delete this item
+// return Key("../" + key + "_backup", fields); // Create backup sibling
+
+return {
+  name: fields["name"] + "hi"
+};
+`;
+      await writeFile(filePath, defaultActionContent);
+      setTempFilePath(filePath);
+      openExternalEditor(filePath);
+
+      setMode("EXEC_ACTION_WAIT");
+      setStatusMessage(
+        `Edit ACTION expression in ${fileName}. Save, close, then press ENTER.`,
+      );
+    } catch (e: any) {
+      setStatusMessage(`Error: ${e.message}`);
+      setMode("BROWSE");
+    }
+  };
+
+  const handleExecActionFinish = async () => {
+    if (!tempFilePath) return;
+    try {
+      const content = await readFile(tempFilePath, "utf-8");
+      setExecAction(content.trim());
+      await unlink(tempFilePath);
+      setTempFilePath(null);
+
+      setMode("EXEC_SAVE_CONFIRM");
+      setStatusMessage("Save this action to a file? (y/n)");
+    } catch (e: any) {
+      setStatusMessage(`Error: ${e.message}`);
+      setMode("BROWSE");
+    }
+  };
+
+  const finalizeExec = async (save: boolean) => {
+    const targetBase64 = Buffer.from(execTarget).toString("base64");
+    const actionBase64 = Buffer.from(execAction).toString("base64");
+    const execPath = path === "/" ? "/" : path;
+
+    const recording: RecordingFile = {
+      header: DEFAULT_HEADER,
+      actions: [
+        {
+          type: "exec",
+          path: execPath,
+          targetBase64,
+          actionBase64,
+        },
+      ],
+    };
+
+    let finalPath = "";
+    if (save) {
+      finalPath = `exec-${Date.now()}.rlsactions`;
+      const content = serializeRlsActions(recording);
+      await writeFile(finalPath, content);
+      setStatusMessage(`Saved to ${finalPath}. Starting playback...`);
+    } else {
+      finalPath = `temp-exec-${Date.now()}.rlsactions`;
+      const content = serializeRlsActions(recording);
+      await writeFile(finalPath, content);
+      setStatusMessage("Starting playback...");
+    }
+
+    // Small delay to read message
+    setTimeout(() => {
+      onStartPlayback(finalPath);
+    }, 1000);
   };
 
   // --- INPUT HANDLING ---
@@ -430,6 +603,12 @@ export default function Explorer({ db, onStartPlayback }: ExplorerProps) {
         return;
       }
 
+      // Exec Expression (x)
+      if (input === "x") {
+        handleExecStart();
+        return;
+      }
+
       // Load Recording (l)
       if (input === "l") {
         setMode("LOAD_RECORDING");
@@ -458,6 +637,39 @@ export default function Explorer({ db, onStartPlayback }: ExplorerProps) {
       }
       return; // Handled by TextInput onSubmit
     }
+    if (mode === "EXEC_TARGET_WAIT") {
+      if (key.return) {
+        handleExecTargetFinish();
+      }
+      if (key.escape) {
+        setMode("BROWSE");
+        setTempFilePath(null);
+      }
+      return;
+    }
+
+    if (mode === "EXEC_ACTION_WAIT") {
+      if (key.return) {
+        handleExecActionFinish();
+      }
+      if (key.escape) {
+        setMode("BROWSE");
+        setTempFilePath(null);
+      }
+      return;
+    }
+
+    if (mode === "EXEC_SAVE_CONFIRM") {
+      if (input === "y" || key.return) {
+        finalizeExec(true);
+      } else if (input === "n") {
+        finalizeExec(false);
+      } else if (key.escape) {
+        setMode("BROWSE");
+      }
+      return;
+    }
+
     if (mode === "ADD_VALUE") {
       if (key.escape) {
         setMode("BROWSE");
@@ -876,7 +1088,7 @@ export default function Explorer({ db, onStartPlayback }: ExplorerProps) {
           <Text color="green">{String(data)}</Text>
           <Box height={1} />
           <Text color="gray">
-            Back: BS. Edit: 'e'. Dump: 'd'. File Edit: 'f'.
+            Back: BS. Edit: 'e'. Dump: 'd'. File Edit: 'f'. Exec: 'x'.
           </Text>
         </Box>
       )}
@@ -901,7 +1113,7 @@ export default function Explorer({ db, onStartPlayback }: ExplorerProps) {
           <Box height={1} />
           <Text color="gray">
             Nav: ↑↓/Enter/BS. Add: 'a'. Edit(File): 'f'. Del: 'r'. Dump: 'd'.
-            Preview: 'g'. Events: 'v'.
+            Preview: 'g'. Events: 'v'. Exec: 'x'.
           </Text>
           <Text color="gray">
             {isRecording
@@ -1117,6 +1329,83 @@ export default function Explorer({ db, onStartPlayback }: ExplorerProps) {
           <Box height={1} />
           <Text bold>Press 'y' or ENTER to apply changes.</Text>
           <Text>Press 'n' or ESC to go back to review.</Text>
+        </Box>
+      )}
+
+      {/* Exec Target Wait */}
+      {mode === "EXEC_TARGET_WAIT" && (
+        <Box
+          flexDirection="column"
+          borderColor="yellow"
+          borderStyle="round"
+          padding={1}
+        >
+          <Text bold color="yellow">
+            🎯 EDITING TARGET EXPRESSION
+          </Text>
+          <Box height={1} />
+          <Text>External editor opened for target condition.</Text>
+          <Text>
+            Edit the file, save, close it, then press <Text bold>ENTER</Text> to
+            continue.
+          </Text>
+          <Text color="gray">Press ESC to cancel.</Text>
+        </Box>
+      )}
+
+      {/* Exec Action Wait */}
+      {mode === "EXEC_ACTION_WAIT" && (
+        <Box
+          flexDirection="column"
+          borderColor="yellow"
+          borderStyle="round"
+          padding={1}
+        >
+          <Text bold color="yellow">
+            ⚡ EDITING ACTION EXPRESSION
+          </Text>
+          <Box height={1} />
+          <Text>External editor opened for action logic.</Text>
+          <Text>
+            Edit the file, save, close it, then press <Text bold>ENTER</Text> to
+            continue.
+          </Text>
+          <Text color="gray">Press ESC to cancel.</Text>
+        </Box>
+      )}
+
+      {/* Exec Save Confirm */}
+      {mode === "EXEC_SAVE_CONFIRM" && (
+        <Box
+          flexDirection="column"
+          borderColor="cyan"
+          borderStyle="round"
+          padding={1}
+        >
+          <Text bold color="cyan">
+            💾 SAVE ACTION?
+          </Text>
+          <Box height={1} />
+          <Text>Do you want to save this action to a file?</Text>
+          <Box height={1} />
+          <Text>
+            <Text bold color="green">
+              Y
+            </Text>{" "}
+            - Save to .rlsactions file and run
+          </Text>
+          <Text>
+            <Text bold color="red">
+              N
+            </Text>{" "}
+            - Run without saving
+          </Text>
+          <Text>
+            <Text bold color="gray">
+              ESC
+            </Text>{" "}
+            - Cancel
+          </Text>
         </Box>
       )}
 

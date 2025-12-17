@@ -3,3 +3,4 @@ node_modules/
 dump-*.json
 temp*.json
 *.rlsactions
+exec_*.js
